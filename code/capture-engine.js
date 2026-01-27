@@ -1,6 +1,11 @@
 autowatch = 1;
-inlets = 1;   // All messages via prepend (record, time)
-outlets = 1;  // 0: OSC out (create_simpler, LED updates)
+inlets = 1;   // All messages via prepend (record, time, arm, disarm, start, stop, query)
+outlets = 2;  // 0: OSC out (create_simpler, LED updates), 1: UI state broadcasts
+
+post("\n");
+post("========================================\n");
+post("[PARSE] capture-engine.js LOADED at " + new Date().toISOString() + "\n");
+post("========================================\n");
 
 // LED state constants
 var LED_OFF = 0;
@@ -16,6 +21,9 @@ var isArmed = false;
 var isRecording = false;
 var captureCount = 0;
 var lastFilePath = "";
+
+// UI State Machine: "idle" | "pending" | "recording" | "stopping"
+var captureState = "idle";
 
 // Beat sync state
 var lastQuantBoundary = -1;  // For detecting quantization boundaries
@@ -58,6 +66,26 @@ var api = new LiveAPI();
 
 // Task for deferred initialization (LiveAPI needs time to be ready in v8 object)
 var initTask = new Task(deferredInit);
+
+// =============================================================================
+// GENERIC MESSAGE HANDLER - logs everything the v8 receives
+// =============================================================================
+
+// Catch-all for any message - logs what we receive
+function anything() {
+    var args = arrayfromargs(messagename, arguments);
+    post("[v8 RX] messagename='" + messagename + "' args=" + JSON.stringify(args) + "\n");
+}
+
+// =============================================================================
+// EARLY MESSAGE HANDLERS (defined before any code runs to catch early messages)
+// =============================================================================
+
+// Stub for time messages that may arrive before full initialization
+// Will be overwritten by proper handler at end of file
+function time(value) {
+    // Early message - ignore or queue
+}
 
 // =============================================================================
 // INITIALIZATION
@@ -120,6 +148,8 @@ function quantizationChanged(args) {
             quantizationValue = newValue;
             quantizationBeats = QUANT_TO_BEATS[newValue];
             post("[quant] ✓ Changed to: " + QUANT_NAMES[newValue] + " (" + quantizationBeats + " beats)\n");
+            // Broadcast to UI
+            broadcastQuantization();
         }
     }
 }
@@ -209,6 +239,117 @@ function sendLedState(state) {
 }
 
 // =============================================================================
+// UI STATE BROADCASTING (outlet 1 → port 11009)
+// =============================================================================
+
+function broadcastState() {
+    outlet(1, "/capture/state", captureState);
+    post("[ui] State broadcast: " + captureState + "\n");
+}
+
+function broadcastQuantization() {
+    var quantName = QUANT_NAMES[quantizationValue] || "1/4";
+    outlet(1, "/capture/quantization", quantName);
+    post("[ui] Quantization broadcast: " + quantName + "\n");
+}
+
+function broadcastFile(filePath) {
+    outlet(1, "/capture/file", filePath);
+    post("[ui] File broadcast: " + filePath + "\n");
+}
+
+// =============================================================================
+// OSC HANDLERS (from UI via port 11008)
+// =============================================================================
+
+// Arm recording (quantized start on next beat boundary)
+function arm() {
+    post("[arm] *** FUNCTION CALLED ***\n");
+    if (captureState !== "idle") {
+        post("[arm] Ignored - already in state: " + captureState + "\n");
+        return;
+    }
+
+    refreshProjectPath();
+    var transportPlaying = (Date.now() - lastTimeUpdate) < 500;
+
+    if (transportPlaying && quantizationBeats > 0) {
+        // Transport playing with quantization - wait for beat
+        captureState = "pending";
+        isArmed = true;
+        sendLedState(LED_RED_FLASH);
+        post("[arm] Armed, waiting for beat boundary\n");
+    } else {
+        // Transport stopped or no quantization - immediate start
+        startRecording();
+    }
+    broadcastState();
+}
+
+// Disarm/stop recording (quantized stop on next beat boundary)
+function disarm() {
+    post("[disarm] *** FUNCTION CALLED ***\n");
+    if (captureState === "idle") {
+        post("[disarm] Ignored - already idle\n");
+        return;
+    }
+
+    isArmed = false;
+
+    if (captureState === "recording") {
+        var transportPlaying = (Date.now() - lastTimeUpdate) < 500;
+        if (transportPlaying && quantizationBeats > 0) {
+            // Transport playing with quantization - wait for beat to stop
+            captureState = "stopping";
+            sendLedState(LED_GREEN_FLASH);
+            post("[disarm] Stopping, waiting for beat boundary\n");
+        } else {
+            // Transport stopped or no quantization - immediate stop
+            stopRecording();
+        }
+    } else {
+        // Was pending - just cancel
+        captureState = "idle";
+        sendLedState(LED_OFF);
+        post("[disarm] Cancelled pending arm\n");
+    }
+    broadcastState();
+}
+
+// Immediate start (bypass quantization)
+function start() {
+    post("[start] *** FUNCTION CALLED ***\n");
+    if (captureState === "recording") {
+        post("[start] Ignored - already recording\n");
+        return;
+    }
+
+    refreshProjectPath();
+    isArmed = true;
+    startRecording();
+}
+
+// Immediate stop (bypass quantization)
+function stop() {
+    post("[stop] *** FUNCTION CALLED ***\n");
+    if (captureState !== "recording" && captureState !== "stopping") {
+        post("[stop] Ignored - not recording\n");
+        return;
+    }
+
+    isArmed = false;
+    stopRecording();
+}
+
+// Query current state (UI requests on connect)
+function query() {
+    post("[query] *** FUNCTION CALLED ***\n");
+    post("[query] Sending current state\n");
+    broadcastState();
+    broadcastQuantization();
+}
+
+// =============================================================================
 // RECORDING CONTROL
 // =============================================================================
 
@@ -246,6 +387,7 @@ function record(value) {
 }
 
 function bang() {
+    post("[bang] *** FUNCTION CALLED *** (this means sel is sending bangs, not symbols!)\n");
     // For footswitch (Phase 7) - toggle on bang
     record(isArmed ? 0 : 1);
 }
@@ -254,16 +396,21 @@ function bang() {
 // BEAT SYNC (Phase 6)
 // =============================================================================
 
-function time(value) {
+function songtime(value) {
     // Receives current_song_time from live.observer via prepend
+    // Skip invalid values (e.g., "none" when observer not ready)
+    if (typeof value !== 'number' || isNaN(value)) {
+        return;
+    }
+
     lastTimeUpdate = Date.now();
 
     // Handle "None" quantization (immediate)
     if (quantizationBeats === 0) {
-        // With "None", we trigger on any time update if armed state changed
-        if (isArmed && !isRecording) {
+        // With "None", we trigger on any time update based on state
+        if (captureState === "pending") {
             startRecording();
-        } else if (!isArmed && isRecording) {
+        } else if (captureState === "stopping") {
             stopRecording();
         }
         return;
@@ -278,10 +425,10 @@ function time(value) {
 }
 
 function onQuantBoundary() {
-    // Trigger start/stop on quantization boundary when armed state differs from recording state
-    if (isArmed && !isRecording) {
+    // Trigger start/stop on quantization boundary based on captureState
+    if (captureState === "pending") {
         startRecording();
-    } else if (!isArmed && isRecording) {
+    } else if (captureState === "stopping") {
         stopRecording();
     }
 }
@@ -315,10 +462,14 @@ function startRecording() {
     recorder.message("open", lastFilePath);
     recorder.message(1);
     isRecording = true;
+    captureState = "recording";
     post("[record] Started:", lastFilePath, "\n");
 
     // LED: green when recording
     sendLedState(LED_GREEN);
+
+    // Broadcast state to UI
+    broadcastState();
 }
 
 function stopRecording() {
@@ -329,6 +480,7 @@ function stopRecording() {
 
     recorder.message(0);
     isRecording = false;
+    captureState = "idle";
     post("[record] Stopped:", lastFilePath, "\n");
 
     // LED: off when stopped
@@ -337,6 +489,21 @@ function stopRecording() {
     // Send OSC to create Simpler with captured audio
     post("[osc] Sending /looping/capture/create_simpler", lastFilePath, "\n");
     outlet(0, "/looping/capture/create_simpler", lastFilePath);
+
+    // Broadcast state and file to UI
+    broadcastState();
+    broadcastFile(lastFilePath);
+}
+
+// =============================================================================
+// MESSAGE HANDLER ALIASES
+// =============================================================================
+
+// In v8, "time" may conflict with built-in. Use alias pattern.
+// The Max patch should use "prepend songtime" instead of "prepend time"
+// But we also define "time" as an alias for backwards compatibility
+function time(value) {
+    songtime(value);
 }
 
 // =============================================================================

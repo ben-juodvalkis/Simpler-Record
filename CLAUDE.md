@@ -88,24 +88,89 @@ function record(value) {
 }
 ```
 
-## Current Dependencies (to be removed)
+## OSC Integration
 
-The device currently sends OSC messages to external systems:
+The device communicates via OSC for UI control and feedback.
 
-| Message | Port | Purpose | Status |
-|---------|------|---------|--------|
-| `/looping/capture/create_simpler [path]` | 11002 | Create MIDI track + load Simpler | **Needs refactor** |
-| `/looping/capture/led [pedal] [state]` | 11012 | Footswitch LED feedback | **Remove or make optional** |
+### Incoming Commands (Port 11008)
 
-## Refactoring Goal
+| Message | Purpose |
+|---------|---------|
+| `/capture/arm` | Arm recording (quantized start on next beat boundary) |
+| `/capture/disarm` | Disarm/stop recording (quantized stop on next beat boundary) |
+| `/capture/start` | Start recording immediately (bypass quantization) |
+| `/capture/stop` | Stop recording immediately (bypass quantization) |
+| `/capture/query` | Request current state (for UI sync on connect) |
 
-Make the device fully self-contained by:
-1. Using LiveAPI directly to create MIDI tracks
-2. Using LiveAPI/browser to load audio into Simpler
-3. Removing external OSC dependencies
-4. Making footswitch integration optional
+### Outgoing State (Port 11009)
 
-See `TODO.md` for detailed refactoring tasks.
+| Message | Purpose |
+|---------|---------|
+| `/capture/state [state]` | State machine: `idle`, `pending`, `recording`, `stopping` |
+| `/capture/quantization [name]` | Current quantization setting (e.g., "1/4", "1 Bar") |
+| `/capture/file [path]` | Path to last recorded file |
+
+### Other Outgoing (Port 11002, 11012)
+
+| Message | Port | Purpose |
+|---------|------|---------|
+| `/looping/capture/create_simpler [path]` | 11002 | Create MIDI track + load Simpler |
+| `/looping/capture/led [pedal] [state]` | 11012 | Footswitch LED feedback |
+
+### Max Patch Wiring
+
+```
+[udpreceive 11008]
+        |
+[osc-route /capture]
+        |
+[route /arm /disarm /start /stop /query]
+  |     |      |      |      |
+[arm] [disarm] [start] [stop] [query]  <- message boxes
+  \     \       |       /      /
+   \___________\|/_____/______/
+               |
+         [v8 capture-engine.js]
+          |              |
+     outlet 0       outlet 1
+          |              |
+    (create_simpler, [udpsend 127.0.0.1 11009]
+     LED updates)
+```
+
+## V8 Object Quirks
+
+### Function Name Conflicts
+
+The `time` function conflicts with something in v8. Use early stub + alias pattern:
+
+```javascript
+// Early stub near top of file
+function time(value) { /* ignore */ }
+
+// Actual handler with different name
+function songtime(value) {
+    if (typeof value !== 'number' || isNaN(value)) return;
+    // ... handle time updates
+}
+
+// Alias at end of file
+function time(value) { songtime(value); }
+```
+
+### live.observer "none" Values
+
+When `live.observer` can't read a property, it outputs `none` as a symbol:
+
+```javascript
+function songtime(value) {
+    // Guard against invalid values
+    if (typeof value !== 'number' || isNaN(value)) {
+        return;
+    }
+    // ...
+}
+```
 
 ## Testing
 

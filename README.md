@@ -25,10 +25,21 @@ A Max for Live device that captures audio and automatically loads it into a Simp
 
 1. **Add device to a return track** - The device needs audio input, so a return track with Audio Routes works well
 2. **Configure audio source** - Use the BrowseRouting UI to select your audio input (e.g., audio interface input)
-3. **Arm recording** - Click the toggle or use a footswitch (if configured)
+3. **Arm recording** - Click the toggle, use a footswitch, or use the Looping UI
 4. **Play** - Recording starts on the next quantization boundary (respects Ableton's global quantization)
 5. **Stop** - Toggle off; recording stops on the next quantization boundary
 6. **Auto-creates Simpler** - A new MIDI track appears with your captured audio loaded in a Simpler
+
+## UI Integration (Looping)
+
+The device can be controlled via OSC from the [Looping](https://github.com/ben-juodvalkis/Looping) iPad interface:
+
+- **Tap** to arm/disarm (respects global quantization)
+- **Hold** to record while held (release stops immediately, bypasses quantization)
+
+Two UI buttons are available:
+1. **REC** (global) - Records from external audio input
+2. **REC TO SIMPLER** (per-track) - Routes track audio via send, then records
 
 ## How It Works
 
